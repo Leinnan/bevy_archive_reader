@@ -1,9 +1,10 @@
 use bevy_app::Plugin;
 use bevy_asset::{
     AssetApp,
-    io::{AssetReader, AssetReaderError, AssetSource, AssetSourceId, PathStream, Reader},
+    io::{AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceId, PathStream, Reader},
 };
 use bevy_derive::Deref;
+use bevy_reflect::TypePath;
 use std::{
     io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
@@ -129,7 +130,7 @@ impl ArchiveReaderSettings {
     }
 }
 
-#[derive(Deref)]
+#[derive(Deref, TypePath)]
 pub struct ArchiveAssetReader {
     #[deref]
     settings: ArchiveReaderSettings,
@@ -169,8 +170,9 @@ impl ArchivePlugin {
 impl Plugin for ArchivePlugin {
     fn build(&self, app: &mut bevy_app::App) {
         let settings = self.settings.clone();
-        let builder = AssetSource::build()
-            .with_reader(move || Box::new(ArchiveAssetReader::new(settings.clone())));
+
+        let builder =
+            AssetSourceBuilder::new(move || Box::new(ArchiveAssetReader::new(settings.clone())));
         app.register_asset_source(AssetSourceId::Default, builder);
     }
 }
