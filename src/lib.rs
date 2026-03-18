@@ -56,7 +56,15 @@ impl From<&ArchivePath> for PathBuf {
                 let Some(exe_dir) = exe_dir.parent() else {
                     return PathBuf::from_str(file_name.as_str()).unwrap_or_default();
                 };
-                exe_dir.join("..").join(file_name)
+                if cfg!(target_os = "ios") {
+                    // iOS .app bundles have the executable at the bundle root
+                    // Resources are also at the bundle root
+                    exe_dir.join(file_name)
+                } else {
+                    // macOS .app bundles have exe at Contents/MacOS/binary
+                    // Resources at Contents/Resources/
+                    exe_dir.join("..").join(file_name)
+                }
             }
             ArchivePath::AbsolutePath(path_buf) => path_buf.clone(),
         }
