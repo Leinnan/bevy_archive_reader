@@ -37,5 +37,6 @@ Generating archives should be done outside of the game (or at least outside of t
 
 | bevy | bevy_archive_reader |
 | ---: | ---------: |
+| 0.19 |        0.3 |
 | 0.18 |        0.2 |
 | 0.17 |        0.1 |
