@@ -25,6 +25,12 @@ crossbeam-channel = "0.5"
 futures-lite = "2.0.1"
 walkdir = {optional = true, version ="2"}
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+async-lock = "3"
+# zip's aes-crypto pulls getrandom; the web backend also needs
+# `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 bevy_android = { version = "0.19" }
 bevy_winit = { version = "0.19" }

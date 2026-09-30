@@ -142,10 +142,17 @@ impl ArchiveReaderSettings {
 pub struct ArchiveAssetReader {
     #[deref]
     settings: ArchiveReaderSettings,
+    /// On the web the archive is fetched over HTTP once and kept in memory.
+    #[cfg(target_arch = "wasm32")]
+    archive_bytes: async_lock::OnceCell<Option<std::sync::Arc<[u8]>>>,
 }
 impl ArchiveAssetReader {
     pub fn new(settings: ArchiveReaderSettings) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            #[cfg(target_arch = "wasm32")]
+            archive_bytes: async_lock::OnceCell::new(),
+        }
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -188,7 +195,49 @@ trait FileReader: Read + Seek + Sync + Send {}
 impl<T: Read + Seek + Sync + Send> FileReader for T {}
 
 impl ArchiveAssetReader {
-    fn get_reader(&self) -> Option<ZipArchive<Box<dyn FileReader>>> {
+    fn open_zip(&self, file: impl FileReader + 'static) -> Option<ZipArchive<Box<dyn FileReader>>> {
+        let reader: Box<dyn FileReader> = if self.obfuscate {
+            Box::new(Xor::new(file))
+        } else {
+            Box::new(file)
+        };
+
+        ZipArchive::new(Box::new(BufReader::new(reader)) as Box<dyn FileReader>).ok()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn fetch_archive(&self) -> Option<std::sync::Arc<[u8]>> {
+        use bevy_asset::io::wasm::HttpWasmAssetReader;
+
+        let path = self.path.get_zip_path();
+        let http = HttpWasmAssetReader::new("");
+        let mut reader = match http.read(&path).await {
+            Ok(reader) => reader,
+            Err(err) => {
+                bevy_log::error!("Failed to fetch archive {}: {err}", path.display());
+                return None;
+            }
+        };
+        let mut bytes = Vec::new();
+        if let Err(err) = reader.read_to_end(&mut bytes).await {
+            bevy_log::error!("Failed to read archive {}: {err}", path.display());
+            return None;
+        }
+        Some(bytes.into())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn get_reader(&self) -> Option<ZipArchive<Box<dyn FileReader>>> {
+        let bytes = self
+            .archive_bytes
+            .get_or_init(|| self.fetch_archive())
+            .await
+            .clone()?;
+        self.open_zip(std::io::Cursor::new(bytes))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn get_reader(&self) -> Option<ZipArchive<Box<dyn FileReader>>> {
         let path = self.path.get_zip_path();
         #[cfg(target_os = "android")]
         let file = {
@@ -205,20 +254,14 @@ impl ArchiveAssetReader {
         };
         #[cfg(not(target_os = "android"))]
         let file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
-        let reader: Box<dyn FileReader> = if self.obfuscate {
-            Box::new(Xor::new(file))
-        } else {
-            Box::new(file)
-        };
-
-        ZipArchive::new(Box::new(BufReader::new(reader)) as Box<dyn FileReader>).ok()
+        self.open_zip(file)
     }
     pub async fn read_file<'a>(
         &'a self,
         path: &'a std::path::Path,
         is_meta: bool,
     ) -> Result<impl Reader + 'a, AssetReaderError> {
-        let Some(mut archive) = self.get_reader() else {
+        let Some(mut archive) = self.get_reader().await else {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         };
         let path = if is_meta {
@@ -272,7 +315,7 @@ impl AssetReader for ArchiveAssetReader {
         &'a self,
         path: &'a Path,
     ) -> Result<Box<PathStream>, AssetReaderError> {
-        let Some(mut archive) = self.get_reader() else {
+        let Some(mut archive) = self.get_reader().await else {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         };
         let mut mapped_stream = Vec::new();
@@ -290,7 +333,7 @@ impl AssetReader for ArchiveAssetReader {
     }
 
     async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
-        if let Some(mut archive) = self.get_reader() {
+        if let Some(mut archive) = self.get_reader().await {
             archive
                 .by_name(path.to_str().expect("msg"))
                 .map(|f| f.is_dir())
