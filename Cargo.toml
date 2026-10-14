@@ -12,10 +12,10 @@ default = []
 bundler = ["dep:walkdir"]
 
 [dependencies]
-bevy_app = { version = "0.19" }
-bevy_reflect = { version = "0.19" }
-bevy_asset = { version = "0.19" }
-bevy_log = { version = "0.19" }
+bevy_app = { version = "0.19", default-features = false, features = ["std"] }
+bevy_reflect = { version = "0.19", default-features = false, features = ["std"] }
+bevy_asset = { version = "0.19", default-features = false }
+bevy_log = { version = "0.19", default-features = false }
 zip = { version = "7.0.0", default-features = false, features = ["aes-crypto", "xz", "deflate-flate2-zlib-rs"] }
 async-lock = "3"
 futures-lite = "2.0.1"
