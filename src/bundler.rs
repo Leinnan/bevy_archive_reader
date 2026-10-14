@@ -79,7 +79,6 @@ pub fn bundle_dir(
     settings: &ArchiveSaveSettings,
     include: impl Fn(&Path) -> bool,
 ) -> io::Result<usize> {
-    let started = std::time::Instant::now();
     let mut files = Vec::new();
     for entry in WalkDir::new(src_dir).follow_links(true) {
         let entry = entry.map_err(io::Error::other)?;
@@ -123,11 +122,5 @@ pub fn bundle_dir(
         io::copy(&mut File::open(path)?, &mut zip)?;
     }
     zip.finish().map_err(io::Error::other)?.flush()?;
-    bevy_log::info!(
-        "Bundled {} files into {} in {}ms",
-        files.len(),
-        dst_file.display(),
-        started.elapsed().as_millis()
-    );
     Ok(files.len())
 }

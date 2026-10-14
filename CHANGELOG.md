@@ -20,6 +20,9 @@
 ### Changed
 
 - The `bundler` feature is no longer on by default.
+- New default `bevy` feature gates the asset reader and plugin. With default
+  features off, `Archive` and `bundle_dir` work without any Bevy dependency
+  (for tools and Bevy-free crates).
 - Missing files (most `.meta` lookups) are reported as `NotFound` without
   logging an error.
 - `is_directory` and `read_directory` work for directories implied by file

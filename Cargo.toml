@@ -8,17 +8,19 @@ description = "Reading archives as source of assets in Bevy"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = []
+default = ["bevy"]
+# The asset reader and plugin. Without it only `Archive` (and `bundler`) remain.
+bevy = ["dep:bevy_app", "dep:bevy_reflect", "dep:bevy_asset", "dep:bevy_log", "dep:async-lock", "dep:futures-lite", "dep:bevy_android", "dep:bevy_winit"]
 bundler = ["dep:walkdir"]
 
 [dependencies]
-bevy_app = { version = "0.19", default-features = false, features = ["std"] }
-bevy_reflect = { version = "0.19", default-features = false, features = ["std"] }
-bevy_asset = { version = "0.19", default-features = false }
-bevy_log = { version = "0.19", default-features = false }
+bevy_app = { version = "0.19", optional = true, default-features = false, features = ["std"] }
+bevy_reflect = { version = "0.19", optional = true, default-features = false, features = ["std"] }
+bevy_asset = { version = "0.19", optional = true, default-features = false }
+bevy_log = { version = "0.19", optional = true, default-features = false }
 zip = { version = "7.0.0", default-features = false, features = ["aes-crypto", "xz", "deflate-flate2-zlib-rs"] }
-async-lock = "3"
-futures-lite = "2.0.1"
+async-lock = { version = "3", optional = true }
+futures-lite = { version = "2.0.1", optional = true }
 walkdir = {optional = true, version ="2"}
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -27,8 +29,8 @@ walkdir = {optional = true, version ="2"}
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-bevy_android = { version = "0.19" }
-bevy_winit = { version = "0.19" }
+bevy_android = { version = "0.19", optional = true }
+bevy_winit = { version = "0.19", optional = true }
 
 [dev-dependencies]
 zip = { version = "7.0.0", default-features = false }
