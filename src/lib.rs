@@ -3,37 +3,50 @@ use bevy_asset::{
     AssetApp,
     io::{AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceId, PathStream, Reader},
 };
-use bevy_derive::Deref;
 use bevy_reflect::TypePath;
 use std::{
-    io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
-use xorio::Xor;
-use zip::ZipArchive;
 
+mod archive;
 #[cfg(feature = "bundler")]
 mod bundler;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub use archive::{Archive, ArchiveOptions, normalize};
+#[cfg(feature = "bundler")]
+pub use bundler::{bundle_dir, compression_for};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ArchiveCompression {
+    /// Store every file as is.
     #[default]
     None,
+    /// Deflate every file.
+    Deflate,
+    /// Xz every file: smallest, but slow to decompress.
     Xz,
+    /// Store files that are already compressed (textures, audio, images,
+    /// glTF binaries) and deflate the rest.
+    Auto,
 }
 
-impl From<ArchiveCompression> for zip::CompressionMethod {
-    fn from(compression: ArchiveCompression) -> Self {
-        match compression {
-            ArchiveCompression::None => zip::CompressionMethod::Stored,
-            ArchiveCompression::Xz => zip::CompressionMethod::Xz,
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArchivePath {
+    /// `<exe dir>/../<file>` on desktop (so `Contents/<file>` in a macOS
+    /// bundle), `<exe dir>/<file>` on iOS, the asset name on Android. Kept
+    /// for 0.3 compatibility; prefer [`ArchivePath::BundleResource`].
     FileRelativeToApplicationDirectory(String),
+    /// `<exe dir>/<file>`: portable folders, Steam depots.
+    NextToExecutable(String),
+    /// Where `cargo-bundler` puts a resource mapped to the bundle root:
+    /// - macOS: `<App>.app/Contents/Resources/<file>`
+    /// - iOS: `<App>.app/<file>`
+    /// - Linux (AppImage, deb): `usr/lib/<binary>/<file>`
+    /// - Windows (msi): `<install dir>/Resources/<file>`
+    /// - Android: the asset name.
+    BundleResource(String),
     AbsolutePath(PathBuf),
 }
 
@@ -43,33 +56,68 @@ impl Default for ArchivePath {
     }
 }
 
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
 impl From<&ArchivePath> for PathBuf {
     fn from(value: &ArchivePath) -> Self {
+        let plain = |name: &str| PathBuf::from_str(name).unwrap_or_default();
         match value {
             ArchivePath::FileRelativeToApplicationDirectory(file_name) => {
                 if cfg!(target_os = "android") {
-                    return PathBuf::from_str(file_name.as_str()).unwrap_or_default();
+                    return plain(file_name);
                 }
-                let Ok(exe_dir) = std::env::current_exe() else {
-                    return PathBuf::from_str(file_name.as_str()).unwrap_or_default();
-                };
-                let Some(exe_dir) = exe_dir.parent() else {
-                    return PathBuf::from_str(file_name.as_str()).unwrap_or_default();
+                let Some(exe_dir) = exe_dir() else {
+                    return plain(file_name);
                 };
                 if cfg!(target_os = "ios") {
-                    // iOS .app bundles have the executable at the bundle root
-                    // Resources are also at the bundle root
                     exe_dir.join(file_name)
                 } else {
-                    // macOS .app bundles have exe at Contents/MacOS/binary
-                    // Resources at Contents/Resources/
                     exe_dir.join("..").join(file_name)
                 }
             }
+            ArchivePath::NextToExecutable(file_name) => {
+                exe_dir().map_or_else(|| plain(file_name), |dir| dir.join(file_name))
+            }
+            ArchivePath::BundleResource(file_name) => bundle_resource_path(file_name),
             ArchivePath::AbsolutePath(path_buf) => path_buf.clone(),
         }
     }
 }
+
+/// Where `cargo-bundler` installs the resource `file_name` (mapped to the
+/// bundle root) for the running executable. See
+/// [`ArchivePath::BundleResource`].
+pub fn bundle_resource_path(file_name: &str) -> PathBuf {
+    let plain = || PathBuf::from_str(file_name).unwrap_or_default();
+    if cfg!(target_os = "android") {
+        return plain();
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return plain();
+    };
+    let Some(exe_dir) = exe.parent() else {
+        return plain();
+    };
+    if cfg!(target_os = "ios") {
+        exe_dir.join(file_name)
+    } else if cfg!(target_os = "macos") {
+        exe_dir.join("../Resources").join(file_name)
+    } else if cfg!(target_os = "windows") {
+        exe_dir.join("Resources").join(file_name)
+    } else {
+        let binary = exe
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        exe_dir.join("../lib").join(binary).join(file_name)
+    }
+}
+
 impl ArchivePath {
     #[inline]
     pub fn get_zip_path(&self) -> PathBuf {
@@ -111,12 +159,14 @@ impl ArchiveSaveSettings {
         }
     }
 }
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct ArchiveReaderSettings {
     pub obfuscate: bool,
     pub path: ArchivePath,
     pub password: Option<String>,
 }
+
 impl ArchiveReaderSettings {
     pub fn with_path_relative(self, path: impl ToString) -> Self {
         Self {
@@ -136,169 +186,177 @@ impl ArchiveReaderSettings {
             ..self
         }
     }
+    pub fn options(&self) -> ArchiveOptions {
+        ArchiveOptions {
+            obfuscate: self.obfuscate,
+            password: self.password.clone(),
+        }
+    }
 }
 
-#[derive(Deref, TypePath)]
-pub struct ArchiveAssetReader {
-    #[deref]
-    settings: ArchiveReaderSettings,
-    /// On the web the archive is fetched over HTTP once and kept in memory.
-    #[cfg(target_arch = "wasm32")]
-    archive_bytes: async_lock::OnceCell<Option<std::sync::Arc<[u8]>>>,
+/// Where an [`ArchiveAssetReader`] gets its archive.
+#[derive(Clone)]
+enum ArchiveSource {
+    /// Opened on first use from the settings, and shared by every reader
+    /// the plugin's source builder creates.
+    Lazy(
+        ArchiveReaderSettings,
+        Arc<async_lock::OnceCell<Option<Arc<Archive>>>>,
+    ),
+    /// Opened by the caller.
+    Ready(Arc<Archive>),
 }
+
+/// An [`AssetReader`] over an [`Archive`], optionally rooted at a
+/// directory inside it.
+#[derive(TypePath)]
+pub struct ArchiveAssetReader {
+    source: ArchiveSource,
+    prefix: String,
+}
+
 impl ArchiveAssetReader {
+    /// A reader that opens the archive described by `settings` on first
+    /// use.
     pub fn new(settings: ArchiveReaderSettings) -> Self {
         Self {
-            settings,
-            #[cfg(target_arch = "wasm32")]
-            archive_bytes: async_lock::OnceCell::new(),
+            source: ArchiveSource::Lazy(settings, Arc::default()),
+            prefix: String::new(),
         }
     }
-}
-#[derive(Clone, Debug, Default)]
-pub struct ArchivePlugin {
-    settings: ArchiveReaderSettings,
-}
-impl ArchivePlugin {
-    pub fn with_path_relative(self, path: impl ToString) -> Self {
+
+    /// A reader over an already opened archive.
+    pub fn from_archive(archive: Arc<Archive>) -> Self {
         Self {
-            settings: self.settings.with_path_relative(path),
+            source: ArchiveSource::Ready(archive),
+            prefix: String::new(),
         }
     }
-    pub fn with_path(self, path: ArchivePath) -> Self {
+
+    /// Roots the reader at `prefix` inside the archive (`models` makes
+    /// `a.glb` read `models/a.glb`).
+    pub fn with_prefix(self, prefix: impl AsRef<Path>) -> Self {
         Self {
-            settings: self.settings.with_path(path),
+            prefix: normalize(prefix.as_ref()),
+            ..self
         }
     }
-    pub fn with_obfuscate(self, obfuscate: bool) -> Self {
-        Self {
-            settings: self.settings.with_obfuscate(obfuscate),
-        }
-    }
-    pub fn with_password(self, password: impl ToString) -> Self {
-        Self {
-            settings: self.settings.with_password(password),
-        }
-    }
-}
 
-impl Plugin for ArchivePlugin {
-    fn build(&self, app: &mut bevy_app::App) {
-        let settings = self.settings.clone();
-
-        let builder =
-            AssetSourceBuilder::new(move || Box::new(ArchiveAssetReader::new(settings.clone())));
-        app.register_asset_source(AssetSourceId::Default, builder);
-    }
-}
-trait FileReader: Read + Seek + Sync + Send {}
-impl<T: Read + Seek + Sync + Send> FileReader for T {}
-
-impl ArchiveAssetReader {
-    fn open_zip(&self, file: impl FileReader + 'static) -> Option<ZipArchive<Box<dyn FileReader>>> {
-        let reader: Box<dyn FileReader> = if self.obfuscate {
-            Box::new(Xor::new(file))
-        } else {
-            Box::new(file)
-        };
-
-        ZipArchive::new(Box::new(BufReader::new(reader)) as Box<dyn FileReader>).ok()
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    async fn fetch_archive(&self) -> Option<std::sync::Arc<[u8]>> {
-        use bevy_asset::io::wasm::HttpWasmAssetReader;
-
-        let path = self.path.get_zip_path();
-        let http = HttpWasmAssetReader::new("");
-        let mut reader = match http.read(&path).await {
-            Ok(reader) => reader,
-            Err(err) => {
-                bevy_log::error!("Failed to fetch archive {}: {err}", path.display());
-                return None;
+    async fn archive(&self) -> Option<&Arc<Archive>> {
+        match &self.source {
+            ArchiveSource::Ready(archive) => Some(archive),
+            ArchiveSource::Lazy(settings, cell) => {
+                cell.get_or_init(|| open_archive(settings)).await.as_ref()
             }
-        };
-        let mut bytes = Vec::new();
-        if let Err(err) = reader.read_to_end(&mut bytes).await {
-            bevy_log::error!("Failed to read archive {}: {err}", path.display());
-            return None;
         }
-        Some(bytes.into())
     }
 
-    #[cfg(target_arch = "wasm32")]
-    async fn get_reader(&self) -> Option<ZipArchive<Box<dyn FileReader>>> {
-        let bytes = self
-            .archive_bytes
-            .get_or_init(|| self.fetch_archive())
-            .await
-            .clone()?;
-        self.open_zip(std::io::Cursor::new(bytes))
+    fn full_path(&self, path: &Path) -> String {
+        let path = normalize(path);
+        match (self.prefix.is_empty(), path.is_empty()) {
+            (true, _) => path,
+            (false, true) => self.prefix.clone(),
+            (false, false) => format!("{}/{path}", self.prefix),
+        }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn get_reader(&self) -> Option<ZipArchive<Box<dyn FileReader>>> {
-        let path = self.path.get_zip_path();
-        #[cfg(target_os = "android")]
-        let file = {
-            use std::ffi::CString;
-            use std::io::Cursor;
-            let asset_manager = bevy_android::ANDROID_APP
-                .get()
-                .expect("Bevy must be setup with the #[bevy_main] macro on Android")
-                .asset_manager();
-            let mut opened_asset =
-                asset_manager.open(&CString::new(path.to_str().unwrap()).unwrap())?;
-            let bytes = opened_asset.buffer().ok()?.to_vec();
-            Cursor::new(bytes)
-        };
-        #[cfg(not(target_os = "android"))]
-        let file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
-        self.open_zip(file)
+    fn relative_path(&self, full: &str) -> PathBuf {
+        if self.prefix.is_empty() {
+            return PathBuf::from(full);
+        }
+        PathBuf::from(
+            full.strip_prefix(&self.prefix)
+                .map(|rest| rest.trim_start_matches('/'))
+                .unwrap_or(full),
+        )
     }
+
     pub async fn read_file<'a>(
         &'a self,
-        path: &'a std::path::Path,
+        path: &'a Path,
         is_meta: bool,
     ) -> Result<impl Reader + 'a, AssetReaderError> {
-        let Some(mut archive) = self.get_reader().await else {
-            return Err(AssetReaderError::NotFound(path.to_path_buf()));
+        let not_found = || {
+            AssetReaderError::NotFound(if is_meta {
+                path.with_added_extension("meta")
+            } else {
+                path.to_path_buf()
+            })
         };
-        let path = if is_meta {
-            path.with_added_extension("meta")
-        } else {
-            path.to_path_buf()
+        let Some(archive) = self.archive().await else {
+            return Err(not_found());
         };
-        let file = match &self.password {
-            Some(password) => {
-                archive.by_name_decrypt(path.to_str().expect("msg"), password.as_bytes())
-            }
-            None => archive.by_name(path.to_str().expect("msg")),
-        };
-        let buf = if let Ok(mut file) = file {
-            let size = file.size();
-
-            let mut buf = Vec::with_capacity(size as usize);
-            file.read_to_end(&mut buf).expect("msg");
-            buf
-        } else {
-            bevy_log::error!("There is no file in the archive: {}", path.display());
-            return Err(AssetReaderError::NotFound(path));
-        };
-        let reader: Box<dyn bevy_asset::io::Reader> = Box::new(bevy_asset::io::VecReader::new(buf));
+        let mut full = self.full_path(path);
+        if is_meta {
+            full.push_str(".meta");
+        }
+        // Missing files (most `.meta` lookups) are expected: report them
+        // without logging.
+        if !archive.exists(&full) {
+            return Err(not_found());
+        }
+        let bytes = archive.read(&full).map_err(|err| {
+            bevy_log::error!("Failed to read {full} from the archive: {err}");
+            AssetReaderError::Io(Arc::new(err))
+        })?;
+        let reader: Box<dyn Reader> = Box::new(bevy_asset::io::VecReader::new(bytes));
         Ok(reader)
     }
 }
 
 impl Default for ArchiveAssetReader {
     fn default() -> Self {
-        Self::new(ArchiveReaderSettings {
-            obfuscate: false,
-            path: ArchivePath::default(),
-            password: None,
-        })
+        Self::new(ArchiveReaderSettings::default())
     }
 }
+
+/// Opens the archive `settings` describes, logging failures.
+async fn open_archive(settings: &ArchiveReaderSettings) -> Option<Arc<Archive>> {
+    let path = settings.path.get_zip_path();
+    match open_platform(&path, &settings.options()).await {
+        Ok(archive) => Some(Arc::new(archive)),
+        Err(err) => {
+            bevy_log::error!("Failed to open archive {}: {err}", path.display());
+            None
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn open_platform(path: &Path, options: &ArchiveOptions) -> std::io::Result<Archive> {
+    use bevy_asset::io::wasm::HttpWasmAssetReader;
+
+    let http = HttpWasmAssetReader::new("");
+    let mut reader = http
+        .read(path)
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    Archive::from_bytes(bytes, options)
+}
+
+#[cfg(target_os = "android")]
+async fn open_platform(path: &Path, options: &ArchiveOptions) -> std::io::Result<Archive> {
+    use std::ffi::CString;
+    let asset_manager = bevy_android::ANDROID_APP
+        .get()
+        .expect("Bevy must be setup with the #[bevy_main] macro on Android")
+        .asset_manager();
+    let name = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let mut asset = asset_manager
+        .open(&name)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let bytes = asset.buffer()?.to_vec();
+    Archive::from_bytes(bytes, options)
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+async fn open_platform(path: &Path, options: &ArchiveOptions) -> std::io::Result<Archive> {
+    Archive::open(path, options)
+}
+
 impl AssetReader for ArchiveAssetReader {
     async fn read<'a>(
         &'a self,
@@ -315,50 +373,147 @@ impl AssetReader for ArchiveAssetReader {
         &'a self,
         path: &'a Path,
     ) -> Result<Box<PathStream>, AssetReaderError> {
-        let Some(mut archive) = self.get_reader().await else {
+        let Some(archive) = self.archive().await else {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         };
-        let mut mapped_stream = Vec::new();
-        for i in 0..archive.len() {
-            let Ok(file) = archive.by_index(i) else {
-                continue;
-            };
-            let el_path = file.mangled_name();
-            if el_path.parent().is_some_and(|p| p == path) {
-                mapped_stream.push(el_path);
-            }
+        let full = self.full_path(path);
+        if !archive.is_dir(&full) {
+            return Err(AssetReaderError::NotFound(path.to_path_buf()));
         }
-        let read_dir: Box<PathStream> = Box::new(futures_lite::stream::iter(mapped_stream));
+        let children: Vec<PathBuf> = archive
+            .read_dir(&full)
+            .iter()
+            .map(|child| self.relative_path(child))
+            .collect();
+        let read_dir: Box<PathStream> = Box::new(futures_lite::stream::iter(children));
         Ok(read_dir)
     }
 
     async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
-        if let Some(mut archive) = self.get_reader().await {
-            archive
-                .by_name(path.to_str().expect("msg"))
-                .map(|f| f.is_dir())
-                .map_err(|_| AssetReaderError::NotFound(path.to_path_buf()))
+        let Some(archive) = self.archive().await else {
+            return Err(AssetReaderError::NotFound(path.to_path_buf()));
+        };
+        let full = self.full_path(path);
+        if archive.is_dir(&full) {
+            Ok(true)
+        } else if archive.exists(&full) {
+            Ok(false)
         } else {
             Err(AssetReaderError::NotFound(path.to_path_buf()))
         }
     }
 }
 
+/// Registers an archive as an asset source (the default source unless
+/// [`ArchivePlugin::with_source`] says otherwise). Add it before
+/// `AssetPlugin` when replacing the default source.
+#[derive(Clone)]
+pub struct ArchivePlugin {
+    settings: ArchiveReaderSettings,
+    archive: Option<Arc<Archive>>,
+    source: AssetSourceId<'static>,
+    prefix: String,
+}
+
+impl Default for ArchivePlugin {
+    fn default() -> Self {
+        Self {
+            settings: ArchiveReaderSettings::default(),
+            archive: None,
+            source: AssetSourceId::Default,
+            prefix: String::new(),
+        }
+    }
+}
+
+impl ArchivePlugin {
+    /// Serves an archive the caller already opened, so one [`Archive`] can
+    /// back several sources.
+    pub fn from_archive(archive: Arc<Archive>) -> Self {
+        Self {
+            archive: Some(archive),
+            ..Self::default()
+        }
+    }
+    pub fn with_path_relative(self, path: impl ToString) -> Self {
+        Self {
+            settings: self.settings.with_path_relative(path),
+            ..self
+        }
+    }
+    pub fn with_path(self, path: ArchivePath) -> Self {
+        Self {
+            settings: self.settings.with_path(path),
+            ..self
+        }
+    }
+    pub fn with_obfuscate(self, obfuscate: bool) -> Self {
+        Self {
+            settings: self.settings.with_obfuscate(obfuscate),
+            ..self
+        }
+    }
+    pub fn with_password(self, password: impl ToString) -> Self {
+        Self {
+            settings: self.settings.with_password(password),
+            ..self
+        }
+    }
+    /// The asset source to register (default: [`AssetSourceId::Default`]).
+    pub fn with_source(self, source: impl Into<AssetSourceId<'static>>) -> Self {
+        Self {
+            source: source.into(),
+            ..self
+        }
+    }
+    /// Roots the source at a directory inside the archive.
+    pub fn with_prefix(self, prefix: impl AsRef<Path>) -> Self {
+        Self {
+            prefix: normalize(prefix.as_ref()),
+            ..self
+        }
+    }
+
+    /// The source builder this plugin registers, for callers that register
+    /// sources themselves.
+    pub fn source_builder(&self) -> AssetSourceBuilder {
+        let source = match &self.archive {
+            Some(archive) => ArchiveSource::Ready(archive.clone()),
+            None => ArchiveSource::Lazy(self.settings.clone(), Arc::default()),
+        };
+        let prefix = self.prefix.clone();
+        AssetSourceBuilder::new(move || {
+            Box::new(ArchiveAssetReader {
+                source: source.clone(),
+                prefix: prefix.clone(),
+            })
+        })
+    }
+}
+
+impl Plugin for ArchivePlugin {
+    fn build(&self, app: &mut bevy_app::App) {
+        app.register_asset_source(self.source.clone(), self.source_builder());
+    }
+}
+
+/// Packs `source_path` into an archive. Relative paths resolve against
+/// `CARGO_MANIFEST_DIR` (or the current directory outside cargo);
+/// absolute paths are used as is. See [`bundle_dir`] for filtering.
 #[cfg(feature = "bundler")]
 pub fn bundle_assets(source_path: impl AsRef<Path>, settings: ArchiveSaveSettings) {
-    let cargo_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let asset_dir = std::path::PathBuf::from(&cargo_dir).join(source_path);
-    let archive_path = match settings.path {
-        ArchivePath::FileRelativeToApplicationDirectory(rel) => {
-            std::path::PathBuf::from(cargo_dir).join(rel)
-        }
-        ArchivePath::AbsolutePath(path_buf) => path_buf,
+    let base = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let asset_dir = base.join(source_path);
+    let archive_path = match &settings.path {
+        ArchivePath::FileRelativeToApplicationDirectory(rel)
+        | ArchivePath::NextToExecutable(rel)
+        | ArchivePath::BundleResource(rel) => base.join(rel),
+        ArchivePath::AbsolutePath(path_buf) => path_buf.clone(),
     };
-    bundler::zip_dir(
-        &asset_dir,
-        &archive_path,
-        settings.compression.into(),
-        settings.password,
-        settings.obfuscate,
-    );
+    if let Err(err) = bundle_dir(&asset_dir, &archive_path, &settings, |_| true) {
+        panic!("Failed to bundle {}: {err}", asset_dir.display());
+    }
 }

@@ -1,128 +1,133 @@
-#![allow(unused_variables)]
-#![allow(dead_code)]
+//! Writing archives (`bundler` feature). Keep this out of shipped games.
+
 use std::{
     fs::File,
-    io::{BufWriter, Read, Seek, Write},
+    io::{self, BufWriter, Seek, SeekFrom, Write},
     path::Path,
 };
 use walkdir::WalkDir;
-use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, write::SimpleFileOptions};
 
-trait WriteSeek: Seek + Write + Read + Send {}
-impl<T: Seek + Write + Send + Read> WriteSeek for T {}
+use crate::{ArchiveCompression, ArchiveSaveSettings, archive::XOR_BYTE};
 
-pub(crate) fn zip_dir(
+/// Extensions [`ArchiveCompression::Auto`] stores uncompressed: already
+/// compressed, or not worth the decompression time.
+const STORED_EXTENSIONS: &[&str] = &[
+    "ktx2", "basis", "dds", "png", "jpg", "jpeg", "webp", "ogg", "mp3", "flac", "opus", "glb",
+    "zip", "zst", "gz", "xz",
+];
+
+/// The compression method `compression` picks for the file at `path`.
+pub fn compression_for(compression: ArchiveCompression, path: &Path) -> CompressionMethod {
+    match compression {
+        ArchiveCompression::None => CompressionMethod::Stored,
+        ArchiveCompression::Deflate => CompressionMethod::Deflated,
+        ArchiveCompression::Xz => CompressionMethod::Xz,
+        ArchiveCompression::Auto => {
+            let stored = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    STORED_EXTENSIONS
+                        .iter()
+                        .any(|stored| ext.eq_ignore_ascii_case(stored))
+                });
+            if stored {
+                CompressionMethod::Stored
+            } else {
+                CompressionMethod::Deflated
+            }
+        }
+    }
+}
+
+/// XORs every written byte with [`XOR_BYTE`].
+struct XorWriter<W> {
+    inner: W,
+    scratch: Vec<u8>,
+}
+
+impl<W: Write> Write for XorWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.scratch.clear();
+        self.scratch.extend(buf.iter().map(|byte| byte ^ XOR_BYTE));
+        self.inner.write_all(&self.scratch)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for XorWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+trait WriteSeek: Write + Seek {}
+impl<T: Write + Seek> WriteSeek for T {}
+
+/// Packs every file under `src_dir` for which `include` (given the path
+/// relative to `src_dir`) returns true into `dst_file`. Entries are
+/// written in sorted order with fixed timestamps, so the same input gives
+/// a byte-identical archive (unless a password is set: AES salts are
+/// random). Returns the number of files written.
+pub fn bundle_dir(
     src_dir: &Path,
     dst_file: &Path,
-    method: zip::CompressionMethod,
-    password: Option<String>,
-    obfuscate: bool,
-) {
-    use std::time::Instant;
-    let now = Instant::now();
-    let path = Path::new(dst_file);
-    let archive_file = File::create(dst_file).expect("Could not create archive file");
-    let writer: Box<dyn WriteSeek> = if obfuscate {
-        Box::new(xorio::Xor::new(archive_file))
+    settings: &ArchiveSaveSettings,
+    include: impl Fn(&Path) -> bool,
+) -> io::Result<usize> {
+    let started = std::time::Instant::now();
+    let mut files = Vec::new();
+    for entry in WalkDir::new(src_dir).follow_links(true) {
+        let entry = entry.map_err(io::Error::other)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(src_dir)
+            .map_err(io::Error::other)?
+            .to_path_buf();
+        if include(&relative) {
+            files.push((crate::normalize(&relative), entry.path().to_path_buf()));
+        }
+    }
+    files.sort();
+
+    if let Some(parent) = dst_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let archive_file = File::create(dst_file)?;
+    let writer: Box<dyn WriteSeek> = if settings.obfuscate {
+        Box::new(XorWriter {
+            inner: archive_file,
+            scratch: Vec::new(),
+        })
     } else {
         Box::new(archive_file)
     };
-    let writer = BufWriter::new(writer);
-
-    let prefix = src_dir;
-    let walkdir = WalkDir::new(prefix);
-
-    use bevy_tasks::TaskPool;
-    let task_pool = TaskPool::new();
-    let mut files = Vec::new();
-    let mut directories = Vec::new();
-
-    for entry in WalkDir::new(prefix).into_iter().flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            files.push(entry);
-        } else if path.is_dir()
-            && let Ok(name) = path.strip_prefix(prefix)
-            && !name.as_os_str().is_empty()
-        {
-            directories.push(name.to_string_lossy().into_owned());
+    let mut zip = zip::ZipWriter::new(BufWriter::with_capacity(1 << 20, writer));
+    for (name, path) in &files {
+        let mut options = SimpleFileOptions::default()
+            .compression_method(compression_for(settings.compression, path))
+            .unix_permissions(0o644)
+            .large_file(std::fs::metadata(path)?.len() >= u32::MAX as u64);
+        if let Some(password) = &settings.password {
+            options = options.with_aes_encryption(zip::AesMode::Aes256, password.as_str());
         }
+        zip.start_file(name.as_str(), options)
+            .map_err(io::Error::other)?;
+        io::copy(&mut File::open(path)?, &mut zip)?;
     }
-
+    zip.finish().map_err(io::Error::other)?.flush()?;
     bevy_log::info!(
-        "Found {} files and {} directories",
+        "Bundled {} files into {} in {}ms",
         files.len(),
-        directories.len()
+        dst_file.display(),
+        started.elapsed().as_millis()
     );
-    let mut zip = zip::ZipWriter::new(writer);
-    let mut options = SimpleFileOptions::default()
-        .compression_method(method)
-        .unix_permissions(0o755);
-    if let Some(pwd) = &password {
-        options = options.with_aes_encryption(zip::AesMode::Aes256, pwd.as_str());
-    }
-    for dir in directories {
-        zip.add_directory(dir, options)
-            .expect("Failed to add directory to zip");
-    }
-    use std::sync::mpsc;
-    let (tx, rx) = mpsc::channel();
-    let chunk_size = (files.len() / task_pool.thread_num()).clamp(10, 100);
-
-    // Process files in parallel - only read and prepare data
-    let file_count = files.len();
-    task_pool.scope(|scope| {
-        for chunk in files.chunks(chunk_size) {
-            let tx = tx.clone();
-            let prefix = prefix.to_path_buf();
-            let chunk = chunk.to_vec();
-
-            scope.spawn(async move {
-                for entry in chunk {
-                    let path = entry.path();
-                    let Ok(name) = path
-                        .strip_prefix(&prefix)
-                        .map(|p| p.to_string_lossy().into_owned())
-                    else {
-                        bevy_log::error!("Failed to strip path prefix from {:?}", path);
-                        continue;
-                    };
-
-                    // Read file into memory
-                    match std::fs::read(path) {
-                        Ok(data) => {
-                            tx.send((name, data)).ok();
-                        }
-                        Err(e) => {
-                            bevy_log::error!("Failed to read {:?}: {}", path, e);
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    // Drop the original sender so receiver knows when done
-    drop(tx);
-
-    // Write files sequentially to zip (compression happens here)
-    let mut processed = 0;
-    while let Ok((name, data)) = rx.recv() {
-        zip.start_file(&name, options)
-            .expect("Failed to start file");
-        zip.write_all(&data)
-            .expect("Failed to write file data to zip");
-        processed += 1;
-        if processed % 15 == 0 {
-            bevy_log::info!(
-                "Processed {}/{} files, time: {}ms",
-                processed,
-                file_count,
-                now.elapsed().as_millis()
-            );
-        }
-    }
-    zip.finish().expect("Failed to finish zip");
-    let elapsed = now.elapsed();
-    bevy_log::info!("Finished bundling in {}ms", elapsed.as_millis());
+    Ok(files.len())
 }
