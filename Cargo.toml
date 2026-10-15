@@ -18,7 +18,7 @@ bevy_app = { version = "0.19", optional = true, default-features = false, featur
 bevy_reflect = { version = "0.19", optional = true, default-features = false, features = ["std"] }
 bevy_asset = { version = "0.19", optional = true, default-features = false }
 bevy_log = { version = "0.19", optional = true, default-features = false }
-zip = { version = "7.0.0", default-features = false, features = ["aes-crypto", "xz", "deflate-flate2-zlib-rs"] }
+zip = { version = "8.6.0", default-features = false, features = ["aes-crypto", "xz", "deflate-flate2-zlib-rs"] }
 async-lock = { version = "3", optional = true }
 futures-lite = { version = "2.0.1", optional = true }
 walkdir = {optional = true, version ="2"}
