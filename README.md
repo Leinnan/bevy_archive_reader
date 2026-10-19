@@ -16,9 +16,31 @@ Simple crate for reading Bevy assets from archives. Supports adding password pro
     );
 ```
 
+One opened archive can back several sources, and game code can read from it
+directly (for example to parse config files outside the `AssetServer`):
+
+```rust
+use std::sync::Arc;
+use bevy_archive_reader::{Archive, ArchiveOptions, ArchivePath, ArchivePlugin};
+
+let path = ArchivePath::BundleResource("game.pak".into()).get_zip_path();
+let archive = Arc::new(Archive::open(path, &ArchiveOptions::default().with_obfuscate(true))?);
+let config = archive.read_to_string("config/settings.toml")?;
+
+app.add_plugins((
+    ArchivePlugin::from_archive(archive.clone()),
+    ArchivePlugin::from_archive(archive).with_source("models").with_prefix("models"),
+));
+```
+
+`ArchivePath::BundleResource` resolves where `cargo-bundler` installs a
+resource mapped to the bundle root: `Contents/Resources/` on macOS,
+`usr/lib/<binary>/` in an AppImage or deb, `<install dir>/Resources/` for an
+MSI.
+
 ### Generating Archives
 
-Generating archives should be done outside of the game (or at least outside of the shipped game), for example in a build script.
+Generating archives needs the `bundler` feature (off by default) and should be done outside of the shipped game, for example in a build script or a separate tool binary. `bundle_dir` takes an include filter and writes a reproducible archive; `ArchiveCompression::Auto` stores already compressed files and deflates the rest.
 
 ```rust
         bevy_archive_reader::bundle_assets(
@@ -37,6 +59,7 @@ Generating archives should be done outside of the game (or at least outside of t
 
 | bevy | bevy_archive_reader |
 | ---: | ---------: |
+| 0.20 |        0.4 |
 | 0.19 |        0.3 |
 | 0.18 |        0.2 |
 | 0.17 |        0.1 |
